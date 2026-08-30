@@ -10,7 +10,8 @@
 #include <FastLED.h>
 
 #define MAX_LEDS 700          // Compile-time ceiling: sizes the pixel buffer, 3 bytes each
-#define MAX_TIP_LEDS 200      // Ceiling for the tip section, sizes TipAnimator's scratch buffer
+#define MAX_TIP_LEDS MAX_LEDS // Ceiling for the tip. May exceed the strip length: the wrap is
+                              // then only partly visible. Sizes TipAnimator's buffers.
 #define DEFAULT_LED_COUNT 600 // Runtime-configurable via the "LedCount" web parameter
 #define DEFAULT_TIP_LENGTH 50 // Runtime-configurable via the "Tip_Length" web parameter
 #define LED_PIN 16        // Define your LED strip pin
@@ -40,8 +41,13 @@ bool gReverse = false;
 bool gTipFillUpActive = false;
 CRGB gDotColor = DEFAULT_COLOR;
 uint8_t gDotHue = 0; // where Button3's random colour walk currently sits
+uint8_t gTipHue = 0; // and where Button2's tip colour walk sits
 
-inline int trailLength() { return (int)gLedCount - (int)gTipLength; }
+// Never negative: a tip longer than the strip simply leaves no trail at all
+inline int trailLength() {
+    int t = (int)gLedCount - (int)gTipLength;
+    return (t > 0) ? t : 0;
+}
 
 // Indices are always physical: 0 is the far end from the balloon, gLedCount-1 is the far
 // end of the tip. "Reverse" does not remap anything - the balloon stays at the end of the
@@ -64,11 +70,18 @@ public:
     // with Reverse on it starts at the balloon and runs back towards you.
     // The colour is captured here, so changing it only affects dots fired afterwards and
     // several dots of different colours can be in flight at once.
-    void trigger()
+    void trigger() { trigger(gReverse, false); }
+
+    // reverse: run away from the balloon instead of towards it.
+    // rainbow: cycle the hue as it travels rather than using the current colour.
+    void trigger(bool reverse, bool rainbow)
     {
         Dot d;
-        d.position = gReverse ? travelSpan() - 1.0f : 0.0f;
+        d.dir = reverse ? -1.0f : 1.0f;
+        d.position = reverse ? travelSpan() - 1.0f : 0.0f;
         d.color = currentColor;
+        d.rainbow = rainbow;
+        d.baseHue = random8();
         activeDots.push_back(d);
     }
 
@@ -86,24 +99,25 @@ public:
 
         const int trail = trailLength();
         const float span = travelSpan();
-        const float step = (gReverse ? -speed : speed) * deltaTime;
 
         // Update positions of all active dots based on time passed and speed
         for (int i = 0; i < activeDots.size(); i++)
         {
             // Render the dot at its current floating position with exponential brightness falloff
-            renderDot(activeDots[i].position, activeDots[i].color);
+            CRGB c = dotColorAt(activeDots[i]);
+            renderDot(activeDots[i].position, c);
 
             // Update the dot's position based on the speed (pixels/second)
             float previous = activeDots[i].position;
-            activeDots[i].position += step;
+            activeDots[i].position += activeDots[i].dir * speed * deltaTime;
 
-            // Only meaningful running towards the balloon; in reverse the dot starts there.
-            // Reported per dot so the tip learns each arriving dot's own colour.
-            if (!gReverse && gTipLength > 0 && previous < trail && activeDots[i].position >= trail
+            // Only dots travelling towards the balloon can land on it. Reported per dot,
+            // with that dot's colour, so the tip fills in the colours that arrived.
+            if (activeDots[i].dir > 0.0f && gTipLength > 0
+                && previous < trail && activeDots[i].position >= trail
                 && tipReachedCallback)
             {
-                tipReachedCallback(activeDots[i].color);
+                tipReachedCallback(c);
             }
         }
 
@@ -150,6 +164,8 @@ public:
         dotMode = constrain(mode, 0, 2);
     }
 
+    int getDotMode() const { return dotMode; }
+
     // Fired once per dot, the moment it reaches the start of the tip. Carries that dot's
     // own colour, so the balloon can fill in the colours that actually arrived.
     void onTipReached(std::function<void(CRGB)> callback)
@@ -160,7 +176,11 @@ public:
 private:
     struct Dot {
         float position;
-        CRGB color;   // captured at trigger time, not read live
+        float dir;      // +1 towards the balloon, -1 away from it. Per dot, so autoplay
+                        // can send them both ways at once.
+        CRGB color;     // captured at trigger time, not read live
+        bool rainbow;   // ignore color and cycle the hue as it travels
+        uint8_t baseHue;
     };
 
     std::vector<Dot> activeDots;   // positions and colours of the dots in flight
@@ -172,6 +192,13 @@ private:
     float decayFactor;             // Decay factor for exponential fade
     int dotMode;                   // How dots interact with the tip, see the constructor
     std::function<void(CRGB)> tipReachedCallback;
+
+    // A rainbow dot's colour comes from how far it has travelled, so it shifts as it runs
+    CRGB dotColorAt(const Dot& d) const
+    {
+        if (!d.rainbow) return d.color;
+        return CRGB(CHSV((uint8_t)(d.baseHue + (uint8_t)(d.position * 2.0f)), 255, 255));
+    }
 
     // The FillUp tip animation needs dots to land on the balloon, so it forces mode 0
     int effectiveDotMode() const
@@ -289,6 +316,7 @@ public:
     const char* getModeName() const { return modeNames[mode]; }
 
     void setColor(CRGB c) { color = c; }
+    CRGB getColor() const { return color; }
     void setSpeed(float s) { speed = s; }
     void setBrightness(uint8_t b) { brightness = b; }
     void setHueShift(float h) { hueShift = h; }  // hue steps per second, 0 = use fixed color
@@ -327,8 +355,15 @@ public:
         float dt = (now - lastUpdateTime) / 1000.0f;
         lastUpdateTime = now;
 
+        // n is the full balloon wrap, which may be longer than the strip. Animations are
+        // computed over all of it so the height mapping stays correct, and only the part
+        // that physically exists gets written out. The visible part is the tail of the
+        // wrap, because the tip is anchored to the far end of the strip.
         const int n = (int)gTipLength;
         if (n <= 0) return; // tip disabled, leave those pixels black
+
+        const int visN = (n < (int)gLedCount) ? n : (int)gLedCount;
+        const int offset = n - visN;
 
         if (dt > 0.25f) dt = 0.25f; // guard against the first call and any long stall
 
@@ -365,8 +400,9 @@ public:
             fillPhase = FILL_IDLE;
         }
 
-        // The tip is always the last gTipLength pixels, Reverse does not move it
-        CRGB* tip = &leds[trailLength()];
+        // Modes render the whole wrap into the staging buffer; the blit below picks out
+        // the visible window. Reverse does not move the tip.
+        CRGB* tip = stage;
 
         switch (mode) {
             case 0: travel(tip, n, -1.0f); break; // RiseUp
@@ -382,8 +418,10 @@ public:
             case TIP_MODE_FILLUP: modeFillUp(tip, n); break;
         }
 
-        if (brightness < 255) {
-            for (int i = 0; i < n; i++) tip[i].nscale8(brightness);
+        CRGB* out = &leds[trailLength()];
+        for (int i = 0; i < visN; i++) {
+            out[i] = stage[offset + i];
+            if (brightness < 255) out[i].nscale8(brightness);
         }
     }
 
@@ -406,6 +444,7 @@ private:
     float flash;       // 0..1 whole-balloon glow, decays; the burst leading a reset sweep
     CRGB fillColors[TIP_MAX_FILL_STEPS]; // colour of the dot that delivered each band
     uint8_t scratch[MAX_TIP_LEDS];       // per-pixel state for the fire and sparkle modes
+    CRGB stage[MAX_TIP_LEDS];            // the full wrap, before the visible part is blitted
 
     // One dot's worth of liquid, in that dot's colour. Once the balloon has topped out,
     // the next dot sweeps it back to the other end rather than snapping.
@@ -418,9 +457,10 @@ private:
             // Topped out. Drain it, keeping the colours it was filled with, so the
             // emptying animation shows the same stack of colours that went in.
             if (fillStep >= fillSteps) { fillStep = 0; beginSweep(0.0f); return; }
-            // Band fillStep is the one this dot is adding, so it keeps this dot's colour
-            // and earlier bands keep theirs: the balloon fills in the colours that arrived.
-            if (fillStep < TIP_MAX_FILL_STEPS) fillColors[fillStep] = c;
+            // New liquid enters at the bottom of the balloon and pushes whatever is
+            // already in there upwards, so the newest colour is always the lowest band.
+            for (int i = fillSteps - 1; i > 0; i--) fillColors[i] = fillColors[i - 1];
+            fillColors[0] = c;
             fillStep++;
         } else {
             // Emptied out: refill in one colour, the current one
@@ -1692,6 +1732,7 @@ public:
         state.lastStableState = digitalRead(pin) == LOW;
         state.lastReading = state.lastStableState;
         state.lastDebounceTime = millis();
+        state.pressTime = millis();
         buttons[name] = state;
     }
 
@@ -1706,12 +1747,21 @@ public:
         state.lastStableState = isTouchPressed(state);
         state.lastReading = state.lastStableState;
         state.lastDebounceTime = millis();
+        state.pressTime = millis();
         buttons[name] = state;
     }
 
     // Method to set the button state changed callback
     void onButtonStateChanged(std::function<void(String, bool)> callback) {
         buttonCallback = callback;
+    }
+
+    // How long the button has been down, or how long the last press lasted once released.
+    // Lets the caller tell a tap from a press-and-hold at release time.
+    unsigned long heldFor(const String& name) const {
+        auto it = buttons.find(name);
+        if (it == buttons.end()) return 0;
+        return millis() - it->second.pressTime;
     }
 
     // Method to update the button states; should be called in the loop()
@@ -1739,6 +1789,10 @@ public:
                 // If the reading has been stable longer than debounceDelay
                 if (reading != state.lastStableState) {
                     state.lastStableState = reading;
+
+                    if (reading) {
+                        state.pressTime = currentTime;
+                    }
 
                     // Button state changed, call the callback
                     if (buttonCallback) {
@@ -1784,10 +1838,12 @@ private:
         bool lastReading;     // The last reading from the pin
         unsigned long lastDebounceTime;
         bool inverted;
+        unsigned long pressTime; // when this button last became stably pressed
     };
-    
+
     std::map<String, ButtonState> buttons;
     std::function<void(String, bool)> buttonCallback;
+
     // 25ms, not 5: the USB-serial chip drives GPIO3 (Button3) whenever the monitor is
     // open, and a shorter window lets that register as phantom presses.
     const unsigned long debounceDelay = 25; // Debounce delay in milliseconds
@@ -1807,6 +1863,33 @@ RunningDot dot;
 TipAnimator tip;
 ButtonHandler buttonHandler;
 
+// Undo stack for the dot colour, walked backwards by holding Button3. Only Button3's own
+// colour changes are recorded: the web form calls setDotColor() on every submit, which
+// would otherwise fill this with duplicates.
+#define DOT_COLOR_HISTORY 10
+
+CRGB gColorHistory[DOT_COLOR_HISTORY];
+uint8_t gColorHistoryCount = 0;
+
+void pushDotColorHistory(const CRGB& c) {
+    if (gColorHistoryCount == DOT_COLOR_HISTORY) {
+        // Full: drop the oldest and shift the rest down
+        for (int i = 1; i < DOT_COLOR_HISTORY; i++) {
+            gColorHistory[i - 1] = gColorHistory[i];
+        }
+        gColorHistoryCount--;
+    }
+    gColorHistory[gColorHistoryCount++] = c;
+}
+
+// Takes the most recent entry off the stack. False once it runs out, in which case the
+// colour is left where it is rather than wrapping around.
+bool popDotColorHistory(CRGB& out) {
+    if (gColorHistoryCount == 0) return false;
+    out = gColorHistory[--gColorHistoryCount];
+    return true;
+}
+
 // Single place the dot colour is set, so the FillUp balloon always tracks it
 void setDotColor(const CRGB& c) {
     gDotColor = c;
@@ -1821,10 +1904,30 @@ void setDotColor(const CRGB& c) {
 
 bool gColorDirty = false;
 bool gTipModeDirty = false;
+bool gTipColorDirty = false;
+bool gDotModeDirty = false;
+bool gReverseDirty = false;
 unsigned long gLastSaveTime = 0;
 
+// AutoPlay state lives up here because flushPendingSaves() and handlePropertiesModified()
+// both need it; the rest of the implementation is further down.
+bool gAutoPlay = false;
+bool gAutoPlayDirty = false;
+void setAutoPlay(bool on);
+
+// AutoPlay tuning, all from the "Auto" tab
+uint16_t gAutoMinGap = 350;      // shortest wait between shots, ms
+uint16_t gAutoMaxGap = 1400;     // longest wait between shots, ms
+bool gAutoNewColor = true;       // pick a new colour per shot, or keep the configured one
+uint8_t gAutoRainbowPct = 27;    // chance a shot comes out as a rainbow dot
+uint8_t gAutoReversePct = 43;    // chance a shot runs away from the balloon
+bool gAutoDrift = true;          // let Speed / Width / DecayFactor wander
+uint8_t gAutoAmbient = 45;       // background shimmer brightness, 0 = off
+uint16_t gAutoSweepGap = 10;     // average seconds between sweeps, 0 = off
+
 void flushPendingSaves() {
-    if (!gColorDirty && !gTipModeDirty) return;
+    if (!gColorDirty && !gTipModeDirty && !gTipColorDirty && !gAutoPlayDirty
+        && !gDotModeDirty && !gReverseDirty) return;
 
     unsigned long now = millis();
     if (now - gLastSaveTime < SAVE_INTERVAL_MS) return;
@@ -1838,6 +1941,22 @@ void flushPendingSaves() {
         webConfig.setParam(String("Tip_Mode"), (float)tip.getMode());
         gTipModeDirty = false;
     }
+    if (gTipColorDirty) {
+        webConfig.setParam(String("Tip_Color"), tip.getColor());
+        gTipColorDirty = false;
+    }
+    if (gAutoPlayDirty) {
+        webConfig.setParam(String("AutoPlay"), gAutoPlay);
+        gAutoPlayDirty = false;
+    }
+    if (gDotModeDirty) {
+        webConfig.setParam(String("Tip_DotMode"), (float)dot.getDotMode());
+        gDotModeDirty = false;
+    }
+    if (gReverseDirty) {
+        webConfig.setParam(String("Reverse"), gReverse);
+        gReverseDirty = false;
+    }
 }
 
 // Point FastLED at the configured strip length. The buffer is always MAX_LEDS, but the
@@ -1845,8 +1964,9 @@ void flushPendingSaves() {
 // frame time and needs no reboot.
 void applyGeometry(float rawCount, float rawTip) {
     int count = constrain((int)rawCount, 1, MAX_LEDS);
-    int maxTip = count < MAX_TIP_LEDS ? count : MAX_TIP_LEDS;
-    int tipLen = constrain((int)rawTip, 0, maxTip);
+    // The tip is deliberately NOT limited by the strip length. A wrap longer than the
+    // strip is legal and just means only part of the balloon is lit.
+    int tipLen = constrain((int)rawTip, 0, MAX_TIP_LEDS);
 
     gLedCount = (uint16_t)count;
     gTipLength = (uint16_t)tipLen;
@@ -1856,10 +1976,21 @@ void applyGeometry(float rawCount, float rawTip) {
 
     Serial.print("Strip: ");
     Serial.print(gLedCount);
-    Serial.print(" LEDs, trail 0..");
-    Serial.print(trailLength() - 1);
+    Serial.print(" LEDs, ");
+    if (trailLength() > 0) {
+        Serial.print("trail 0..");
+        Serial.print(trailLength() - 1);
+    } else {
+        Serial.print("no trail");
+    }
     Serial.print(", tip ");
-    Serial.println(gTipLength);
+    Serial.print(gTipLength);
+    if (gTipLength > gLedCount) {
+        Serial.print(" (showing the last ");
+        Serial.print(gLedCount);
+        Serial.print(" of the wrap)");
+    }
+    Serial.println();
 }
 
 void handlePropertiesModified() {
@@ -1885,9 +2016,213 @@ void handlePropertiesModified() {
     tip.setMode((int)webConfig.getParamFloat("Tip_Mode"));
     tip.setFillSteps((int)webConfig.getParamFloat("Tip_FillSteps"));
 
+    gAutoMinGap = (uint16_t)constrain((int)webConfig.getParamFloat("Auto_MinGap"), 50, 20000);
+    gAutoMaxGap = (uint16_t)constrain((int)webConfig.getParamFloat("Auto_MaxGap"), 50, 20000);
+    gAutoNewColor = webConfig.getParamBool("Auto_NewColor");
+    gAutoRainbowPct = (uint8_t)constrain((int)webConfig.getParamFloat("Auto_Rainbow"), 0, 100);
+    gAutoReversePct = (uint8_t)constrain((int)webConfig.getParamFloat("Auto_Reverse"), 0, 100);
+    gAutoDrift = webConfig.getParamBool("Auto_Drift");
+    gAutoAmbient = (uint8_t)constrain((int)webConfig.getParamFloat("Auto_Ambient"), 0, 255);
+    gAutoSweepGap = (uint16_t)constrain((int)webConfig.getParamFloat("Auto_SweepGap"), 0, 600);
+
+    // Last, so turning autoplay off restores the parameters it was drifting, and turning
+    // it on picks up the tuning above
+    setAutoPlay(webConfig.getParamBool("AutoPlay"));
+
     buttonHandler.setInverted("Trigger", webConfig.getParamBool("Invert_Trigger"));
     buttonHandler.setInverted("External", webConfig.getParamBool("Invert_External"));
     buttonHandler.setInverted("Touch", webConfig.getParamBool("Invert_Touch"));
+}
+
+// ---------------------------------------------------------------------------------------
+// AutoPlay: the strip runs itself. Dots fire at random intervals in both directions with
+// changing colours, the dot parameters drift, and a soft sweep crosses the trail now and
+// then so something is always happening without it becoming busy. The tip is left alone -
+// whatever tip mode and colour are configured keep running.
+// ---------------------------------------------------------------------------------------
+#define AUTO_SWEEP_MS 1200
+
+unsigned long gAutoNextShot = 0;
+unsigned long gAutoNextDrift = 0;
+unsigned long gAutoNextEvent = 0;
+unsigned long gAutoSweepStart = 0; // 0 = no sweep running
+int8_t gAutoSweepDir = 1;
+uint8_t gAutoSweepHue = 0;
+uint8_t gAutoHue = 0;
+
+void setAutoPlay(bool on) {
+    if (on == gAutoPlay) return;
+    gAutoPlay = on;
+
+    if (on) {
+        unsigned long now = millis();
+        gAutoNextShot = now + 300;
+        gAutoNextDrift = now;
+        gAutoNextEvent = now + 3000;
+        gAutoSweepStart = 0;
+        // Fixed-colour mode starts from the configured colour, not whatever a previous
+        // autoplay run happened to leave behind
+        if (!gAutoNewColor) setDotColor(webConfig.getParamColor("Color"));
+    } else {
+        // Put back whatever the web config says, since autoplay drifts these
+        dot.setSpeed(webConfig.getParamFloat("Speed"));
+        dot.setWidth(webConfig.getParamFloat("Width"));
+        dot.setDecayFactor(webConfig.getParamFloat("DecayFactor"));
+        setDotColor(webConfig.getParamColor("Color"));
+    }
+    Serial.println(on ? "AutoPlay ON" : "AutoPlay OFF");
+}
+
+void autoPlayUpdate() {
+    if (!gAutoPlay) return;
+    unsigned long now = millis();
+
+    if ((long)(now - gAutoNextShot) >= 0) {
+        uint16_t lo = gAutoMinGap;
+        uint16_t hi = (gAutoMaxGap > lo) ? gAutoMaxGap : (uint16_t)(lo + 1);
+        gAutoNextShot = now + random16(lo, hi);
+
+        bool reverse = random8(100) < gAutoReversePct;
+        bool rainbow = random8(100) < gAutoRainbowPct;
+        if (!rainbow && gAutoNewColor) {
+            gAutoHue += random8(40, 216);
+            setDotColor(CRGB(CHSV(gAutoHue, 255, 255)));
+        }
+        dot.trigger(reverse, rainbow);
+        tip.onDotFired(gDotColor); // no-op unless the tip is in reverse FillUp
+    }
+
+    if (gAutoDrift && (long)(now - gAutoNextDrift) >= 0) {
+        gAutoNextDrift = now + random16(4000, 9000);
+        dot.setSpeed(random16(25, 75));
+        dot.setWidth(1.0f + random8(5));
+        dot.setDecayFactor(2.0f + random8(40) / 10.0f);
+    }
+
+    if (gAutoSweepGap > 0 && (long)(now - gAutoNextEvent) >= 0) {
+        // Jitter the configured average by +/-30% so the sweeps do not feel metronomic
+        unsigned long base = (unsigned long)gAutoSweepGap * 1000UL;
+        gAutoNextEvent = now + base * (70 + (random8() % 61)) / 100;
+        gAutoSweepStart = now;
+        gAutoSweepDir = (random8() < 128) ? 1 : -1;
+        gAutoSweepHue = random8();
+    }
+}
+
+// Background for the trail only. Runs before the dots, which add on top.
+void autoPlayRenderTrail() {
+    if (!gAutoPlay) return;
+
+    const int trail = trailLength();
+    if (trail <= 0) return;
+
+    unsigned long now = millis();
+    uint16_t t = (uint16_t)(now / 24);
+
+    // A dim, slow shimmer so the strip is never completely dead between shots
+    if (gAutoAmbient > 0) {
+        for (int i = 0; i < trail; i++) {
+            uint8_t nz = inoise8(i * 10, t);
+            if (nz < 140) continue; // most of it stays dark
+            uint8_t v = scale8((uint8_t)((nz - 140) << 1), gAutoAmbient);
+            leds[i] = CHSV(gAutoHue + (uint8_t)(i >> 2), 200, v);
+        }
+    }
+
+    // An occasional soft band running the length of the trail
+    if (gAutoSweepStart != 0) {
+        float p = (now - gAutoSweepStart) / (float)AUTO_SWEEP_MS;
+        if (p >= 1.0f) {
+            gAutoSweepStart = 0;
+        } else {
+            float head = (gAutoSweepDir > 0 ? p : 1.0f - p) * trail;
+            float width = trail * 0.12f;
+            if (width < 4.0f) width = 4.0f;
+
+            int lo = (int)(head - width);
+            int hi = (int)(head + width);
+            if (lo < 0) lo = 0;
+            if (hi > trail - 1) hi = trail - 1;
+
+            for (int i = lo; i <= hi; i++) {
+                float k = 1.0f - fabsf(i - head) / width;
+                if (k <= 0.0f) continue;
+                leds[i] += CRGB(CHSV(gAutoSweepHue, 220, (uint8_t)(k * k * 120.0f)));
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Button actions, shared between the buttons themselves and the buzzer chords
+// ---------------------------------------------------------------------------------------
+#define HOLD_MS 1000
+
+bool gButton2Chord = false; // this press was consumed as a buzzer chord
+bool gButton3Chord = false;
+bool gBothChordActive = false; // both modifiers were down when the buzzer went down
+
+void actionNextDotMode() {
+    static const char* const names[3] = {
+        "stop at tip", "run through the tip", "mirrored through the tip"
+    };
+    int m = (dot.getDotMode() + 1) % 3;
+    dot.setDotMode(m);
+    gDotModeDirty = true;
+    Serial.print("Dot mode ");
+    Serial.print(m);
+    Serial.print(": ");
+    Serial.print(names[m]);
+    Serial.println(gTipFillUpActive ? "  (overridden while the tip is in FillUp)" : "");
+}
+
+void actionToggleReverse() {
+    gReverse = !gReverse;
+    gReverseDirty = true;
+    tip.resetFill(); // the balloon starts empty or full depending on the direction
+    Serial.print("Reverse ");
+    Serial.println(gReverse ? "ON - shooting from the balloon"
+                            : "OFF - shooting towards the balloon");
+}
+
+void actionNextTipMode() {
+    tip.nextMode();
+    gTipModeDirty = true;
+    Serial.print("Tip mode ");
+    Serial.print(tip.getMode());
+    Serial.print(": ");
+    Serial.print(tip.getModeName());
+    Serial.println(gTipLength == 0 ? " (tip length is 0, nothing to show)" : "");
+}
+
+void actionRandomTipColor() {
+    gTipHue += random8(40, 216);
+    tip.setColor(CRGB(CHSV(gTipHue, 255, 255)));
+    gTipColorDirty = true;
+    Serial.print("Tip color -> hue ");
+    Serial.println(gTipHue);
+}
+
+void actionRandomDotColor() {
+    pushDotColorHistory(gDotColor); // so a long press can walk back to it
+    gDotHue += random8(40, 216);
+    setDotColor(CRGB(CHSV(gDotHue, 255, 255)));
+    gColorDirty = true;
+    Serial.print("Dot color -> hue ");
+    Serial.println(gDotHue);
+}
+
+void actionUndoDotColor() {
+    CRGB back;
+    if (popDotColorHistory(back)) {
+        setDotColor(back);
+        gColorDirty = true;
+        Serial.print("Dot color undone, ");
+        Serial.print(gColorHistoryCount);
+        Serial.println(" step(s) left");
+    } else {
+        Serial.println("Dot color: nothing left to undo");
+    }
 }
 
 //called if a physical button, trigger, external or touch is pressed/activated
@@ -1897,29 +2232,24 @@ void handleButtonPressed(String name, bool pressed) {
     Serial.print(" ");
     Serial.println(pressed ? "pressed" : "released");
 
-    // Button2 cycles the tip animation and remembers it across reboots
+    // Button2 and Button3 act on release, so the same press can instead serve as a
+    // modifier for a buzzer chord. If it was used that way, the release does nothing.
     if (name == "Button2") {
         if (pressed) {
-            tip.nextMode();
-            gTipModeDirty = true; // saved later by flushPendingSaves()
-            Serial.print("Tip mode ");
-            Serial.print(tip.getMode());
-            Serial.print(": ");
-            Serial.print(tip.getModeName());
-            Serial.println(gTipLength == 0 ? " (tip length is 0, nothing to show)" : "");
+            gButton2Chord = false;
+        } else if (!gButton2Chord) {
+            if (buttonHandler.heldFor(name) >= HOLD_MS) actionRandomTipColor();
+            else                                        actionNextTipMode();
         }
         return;
     }
 
-    // Button3 jumps the dot colour to a random hue. The step is bounded away from 0 and
-    // 256 so consecutive presses are always visibly different.
     if (name == "Button3") {
         if (pressed) {
-            gDotHue += random8(40, 216);
-            setDotColor(CRGB(CHSV(gDotHue, 255, 255)));
-            gColorDirty = true; // saved later by flushPendingSaves()
-            Serial.print("Dot color -> hue ");
-            Serial.println(gDotHue);
+            gButton3Chord = false;
+        } else if (!gButton3Chord) {
+            if (buttonHandler.heldFor(name) >= HOLD_MS) actionUndoDotColor();
+            else                                        actionRandomDotColor();
         }
         return;
     }
@@ -1930,11 +2260,47 @@ void handleButtonPressed(String name, bool pressed) {
     trig = trig|| (name == "Web" && webConfig.getParamBool("Use_Web"));
     if (trig) {
         if (pressed) {
+            // Chords: hold one or both of the small buttons and hit the buzzer
+            bool holdingTip = buttonHandler.isButtonPressed("Button2");
+            bool holdingColor = buttonHandler.isButtonPressed("Button3");
+
+            if (holdingTip && holdingColor) {
+                // Decided on release: a tap flips Reverse, holding toggles AutoPlay
+                gButton2Chord = gButton3Chord = true;
+                gBothChordActive = true;
+                return;
+            }
+            gBothChordActive = false;
+
+            if (holdingTip) {
+                // Cycle how dots interact with the tip, instead of shooting
+                gButton2Chord = true;
+                actionNextDotMode();
+                return;
+            }
+
             // Handle the action for the 'Trigger' button pressed
             Serial.println("Trigger pressed.");
-            dot.trigger();
+            if (holdingColor) {
+                gButton3Chord = true;
+                dot.trigger(gReverse, true); // rainbow dot, hue shifting as it runs
+            } else {
+                dot.trigger();
+            }
             tip.onDotFired(gDotColor); // steps the balloon in FillUp mode when in reverse
         } else {
+            // Resolve the both-buttons chord: tap flips Reverse, hold toggles AutoPlay
+            if (gBothChordActive) {
+                gBothChordActive = false;
+                if (buttonHandler.heldFor(name) >= HOLD_MS) {
+                    setAutoPlay(!gAutoPlay);
+                    gAutoPlayDirty = true;
+                } else {
+                    actionToggleReverse();
+                }
+                return;
+            }
+
             // Handle the action for the 'Trigger' button released
             Serial.println("Trigger  released.");
             // Add any action needed on button release
@@ -1977,6 +2343,7 @@ void setup() {
     webConfig.addParamFloat("DecayFactor", 3.0f);
     webConfig.addParamFloat("LedCount", DEFAULT_LED_COUNT);
     webConfig.addParamBoolean("Reverse", false);  // shoot towards the balloon, or away from it
+    webConfig.addParamBoolean("AutoPlay", false); // run the strip by itself, no triggers needed
 
     // Tip section, shown on its own "Tip" tab (WebConfig groups by the name prefix)
     webConfig.addParamFloat("Tip_Length", DEFAULT_TIP_LENGTH); // 0 disables the tip entirely
@@ -1987,6 +2354,16 @@ void setup() {
     webConfig.addParamFloat("Tip_Mode", 0);       // also cycled by Button2
     webConfig.addParamFloat("Tip_DotMode", 0);    // 0 stop at tip, 1 run through, 2 mirrored
     webConfig.addParamFloat("Tip_FillSteps", 8);  // dots needed to fill the balloon in FillUp mode
+
+    // AutoPlay tuning, shown on its own "Auto" tab. The master switch is "AutoPlay" above.
+    webConfig.addParamFloat("Auto_MinGap", 350);      // shortest wait between shots, ms
+    webConfig.addParamFloat("Auto_MaxGap", 1400);     // longest wait between shots, ms
+    webConfig.addParamBoolean("Auto_NewColor", true); // new colour per shot, or keep Color
+    webConfig.addParamFloat("Auto_Rainbow", 27);      // % of shots that are rainbow dots
+    webConfig.addParamFloat("Auto_Reverse", 43);      // % of shots running away from the balloon
+    webConfig.addParamBoolean("Auto_Drift", true);    // let Speed / Width / DecayFactor wander
+    webConfig.addParamFloat("Auto_Ambient", 45);      // background shimmer 0-255, 0 = off
+    webConfig.addParamFloat("Auto_SweepGap", 10);     // average seconds between sweeps, 0 = off
 
     // Set the web button pressed callback
     webConfig.onWebButtonPressed(handleWebButtonPressed);
@@ -2055,11 +2432,13 @@ void loop() {
     webConfig.handleClient(); // Handle client requests
     buttonHandler.update();   // Update button states and handle presses
     flushPendingSaves();      // Rate-limited NVS writes, never from a button handler
+    autoPlayUpdate();         // Fires its own dots and drifts parameters when enabled
 
-    // One clear/show per frame for the whole strip. Tip first because it assigns its
-    // pixels, dots second because they add on top and may run over the tip.
+    // One clear/show per frame for the whole strip. Tip and the autoplay background
+    // assign their pixels; dots come last because they add on top of both.
     fill_solid(leds, gLedCount, CRGB::Black);
-    tip.update();  // balloon
-    dot.update();  // trail
+    tip.update();          // balloon
+    autoPlayRenderTrail(); // ambient background, trail only
+    dot.update();          // trail
     FastLED.show();
 }

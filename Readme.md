@@ -29,6 +29,13 @@ The strip is therefore two regions:
 
 Set `Tip_Length` to `0` to disable the tip entirely and get a plain strip.
 
+`Tip_Length` is **not** limited by `LedCount`. Setting it longer than the strip is allowed
+and means the wrap is only partly lit: the animations still run over the full balloon shape,
+but only the part that physically exists is shown. Since the tip is anchored to the far end
+of the strip, what you see is the *end* of the wrap. A 600-LED tip on a 300-LED strip
+therefore lights the top point down one side to the bottom — half a balloon — with no trail
+left over. Useful for a balloon that is only half covered, or for wrapping a larger one.
+
 ## Hardware
 
 ### The strip
@@ -101,6 +108,7 @@ tabs by their name prefix — `Tip_Length` appears as *Length* on the *Tip* tab.
 | `TouchSens` | Touch threshold; lower is less sensitive |
 | `LedCount` | Number of LEDs on the strip |
 | `Reverse` | Shoot *from* the balloon back towards you instead of towards it |
+| `AutoPlay` | Run the strip by itself, no triggers needed — see below |
 
 ### Use / Invert
 
@@ -112,7 +120,7 @@ switches.
 
 | Parameter | Meaning |
 | --- | --- |
-| `Tip_Length` | LEDs wrapped around the balloon; `0` disables the tip |
+| `Tip_Length` | LEDs wrapped around the balloon; `0` disables the tip. May exceed `LedCount` |
 | `Tip_Color` | Colour for the tip animations |
 | `Tip_Speed` | Animation speed multiplier |
 | `Tip_Brightness` | Tip brightness, on top of the master `Brightness` |
@@ -156,9 +164,10 @@ the balloon, filling it from the bottom up on both sides at once. After `Tip_Fil
 dots it is full, and the next dot triggers a bright burst and a quick drain back to empty.
 
 FillUp overrides `Tip_DotMode` and `Tip_Color`: dots always stop at the tip so they can
-land, and the balloon is drawn in the **dots' own colours**. Each band keeps the colour of
-the dot that delivered it, so firing red, red, blue stacks those three colours up the
-balloon, and the drain shows the same stack going back down.
+land, and the balloon is drawn in the **dots' own colours**. Each arriving dot's colour goes
+in at the **bottom** of the balloon and pushes what is already in there upwards, the way
+liquid poured in from below would. So firing red, then blue, then green leaves green at the
+bottom, blue above it and red at the top, and the drain shows that same stack.
 
 With `Reverse` on it works the other way round: the balloon starts full and each dot fired
 drains one step out of it. Draining, the balloon is a single colour and follows the current
@@ -169,12 +178,74 @@ colour immediately, so changing colour recolours it on the spot.
 Each dot carries the colour it was fired with, so several differently coloured dots can be
 travelling down the strip at once and changing the colour only affects later shots.
 
-- **Button 2** (GPIO19) cycles through the 11 tip animations. The choice is saved.
-- **Button 3** (GPIO3) jumps the dot colour to a random hue, stepped far enough each press
-  that consecutive presses always look clearly different. Also saved.
+Both buttons have a short press and a press-and-hold action. The short action fires on
+**release**; the hold action fires **after one second, while still held**, so you get
+feedback without waiting, and the release afterwards does nothing.
 
-Both write to flash at a bounded rate rather than on every press — a flash write stalls the
-CPU cache, and doing that from a button handler can disturb the WiFi radio.
+| Button | Tap | Hold ≥ 1 s |
+| --- | --- | --- |
+| **Button 2** (GPIO19) | Next tip animation | Random new **tip** colour, mode unchanged |
+| **Button 3** (GPIO3) | Random new **dot** colour | Step back through previous dot colours |
+
+New colours are stepped far enough round the hue wheel that consecutive presses always look
+clearly different. The last **10** dot colours are remembered, so holding Button 3 walks
+backwards through them one at a time. Once it reaches the oldest it simply stays there
+rather than wrapping around. Only Button 3's own changes are recorded — setting a colour on
+the web page does not add to the history.
+
+Two cases where holding Button 2 has no visible effect: if `Tip_HueShift` is above `0` it
+overrides the tip colour with a continuous cycle, and FillUp draws the balloon in the dots'
+colours rather than the tip colour.
+
+### Chords
+
+Hold a button down and hit the buzzer for a third action. The held button's own action is
+skipped when it is used this way, so a chord never also changes the colour or mode.
+
+| Chord | Result |
+| --- | --- |
+| Hold **Button 3** + buzzer | Shoots a **rainbow dot** whose hue shifts as it travels |
+| Hold **Button 2** + buzzer | Cycles the **dot mode**, `Tip_DotMode` — no dot is fired |
+| Hold **both** + tap buzzer | Toggles **`Reverse`**, the shooting direction |
+| Hold **both** + hold buzzer | Toggles **AutoPlay** on or off |
+
+The both-buttons chord resolves when you let the buzzer go, so a quick hit flips the
+direction and holding it for a second toggles AutoPlay. Cycling the dot mode while the tip
+is in FillUp has no visible effect: that mode forces dots to stop at the tip so they can
+land on the balloon.
+
+All settings are saved, but written to flash at a bounded rate rather than on every press —
+a flash write stalls the CPU cache, and doing that from a button handler can disturb the
+WiFi radio.
+
+## AutoPlay
+
+The strip runs itself, for when nobody is at the buzzer. Toggle it by holding both buttons and
+holding the buzzer, or with the `AutoPlay` checkbox on the web page; the setting is saved.
+
+Dots fire at random intervals in both directions, colours change, the dot parameters drift,
+a dim shimmer keeps the trail alive between shots and a soft band sweeps along now and then.
+All of it is adjustable on the **Auto** tab:
+
+| Parameter | Meaning | Default |
+| --- | --- | --- |
+| `Auto_MinGap` | Shortest wait between shots, ms | 350 |
+| `Auto_MaxGap` | Longest wait between shots, ms | 1400 |
+| `Auto_NewColor` | New colour on every shot; off keeps the configured `Color` | on |
+| `Auto_Rainbow` | Percent of shots that come out as rainbow dots | 27 |
+| `Auto_Reverse` | Percent of shots running *away* from the balloon | 43 |
+| `Auto_Drift` | Let `Speed`, `Width` and `DecayFactor` wander every 4–9 s | on |
+| `Auto_Ambient` | Background shimmer brightness, `0`–`255`; `0` turns it off | 45 |
+| `Auto_SweepGap` | Average seconds between sweeps; `0` turns them off | 10 |
+
+For a calmer look turn `Auto_Ambient` down and `Auto_MinGap` up; for a single-colour show
+turn `Auto_NewColor` off and `Auto_Rainbow` to `0`.
+
+The **tip is left alone** — whatever tip animation and colour are configured keep running
+exactly as in manual mode. The buzzer still works while AutoPlay is on.
+
+Turning AutoPlay off restores `Speed`, `Width`, `DecayFactor` and `Color` from the saved
+configuration, since AutoPlay drifts those while it runs.
 
 ## Building
 
@@ -191,8 +262,10 @@ source — worth avoiding.
 
 - **Web parameter names must be 15 characters or fewer.** That is the ESP32's NVS key
   length limit; a longer name cannot be stored and the setting silently fails to persist.
-- `MAX_LEDS` (700) sizes the pixel buffer at compile time and is the ceiling for
-  `LedCount`. `MAX_TIP_LEDS` (200) is the ceiling for `Tip_Length`.
+- `MAX_LEDS` (700) sizes the pixel buffer at compile time and is the ceiling for both
+  `LedCount` and `Tip_Length`. The tip is rendered into a staging buffer of that size and
+  only its visible window is blitted onto the strip, which is what lets the wrap be longer
+  than the strip.
 - `LedCount` is applied through `FastLED[0].setLeds()`, so strip length changes take effect
   on submit without a reboot.
 - Rendering order in `loop()` is tip first (it assigns pixels), dots second (they add on
